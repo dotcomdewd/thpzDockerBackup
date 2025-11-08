@@ -1,212 +1,171 @@
 #!/bin/bash
-# dockerRestore.sh - Restore Docker images and named volumes from backup.
-# - Checks for Docker; installs it if missing
-# - Loads all *_image.tar files from the chosen backup directory
-# - Restores any volume_*.tar.gz into Docker named volumes
-#
-# Usage:
-#   sudo ./dockerRestore.sh                    # use the most recent backup under ~/docker-backups
-#   sudo ./dockerRestore.sh /path/to/dir       # use a specific backup directory
-#   sudo ./dockerRestore.sh 2025-11-07_12-34-56   # subdir under ~/docker-backups
+# thpzDockerRestore.sh – fixed & bullet-proof
+# Works with sudo, finds the right home, no syntax errors
 
 set -euo pipefail
+IFS=$'\n\t'
 
+# ================= CONFIG =================
+DEFAULT_BACKUP_ROOT="$HOME/docker-backups"
 BACKUP_DIR=""
 
-# ---------- Functions ----------
-
+# ================= HELPERS =================
 require_root() {
-  if [[ "$EUID" -ne 0 ]]; then
-    echo "[-] Please run this script with sudo or as root."
+  if [[ $EUID -ne 0 ]]; then
+    echo "[-] Please run with sudo"
     exit 1
   fi
 }
 
-install_docker_if_missing() {
-  if command -v docker &>/dev/null; then
-    echo "[+] Docker is already installed."
-    return
+fix_sudo_home() {
+  if [[ -n "${SUDO_USER:-}" ]] && [[ "$HOME" = /root* ]]; then
+    export HOME="/home/$SUDO_USER"
+  fi
+}
+
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    echo "[+] Docker already installed"
+    return 0
   fi
 
-  echo "[*] Docker not found. Installing Docker Engine and Compose plugin..."
-
-  apt update
+  echo "[*] Installing Docker Engine + Compose plugin..."
+  apt update -qq
   apt install -y ca-certificates curl gnupg lsb-release
 
-  install -m 0755 -d /etc/apt/keyrings || true
-  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  fi
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
 
-  echo \
-"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-$(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-    > /etc/apt/sources.list.d/docker.list
+  cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable
+EOF
 
-  apt update
+  apt update -qq
   apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-  systemctl enable --now docker
-
-  echo "[+] Docker installed and service started."
+  systemctl enable --now docker.service docker.socket containerd.service >/dev/null 2>&1
+  echo "[+] Docker installed"
 }
 
 pick_backup_dir() {
-  local BACKUP_ROOT="$HOME/docker-backups"
-  local ARG="${1:-}"
+  local arg="${1:-}"
+  local root="${DEFAULT_BACKUP_ROOT}"
 
-  if [[ -n "$ARG" ]]; then
-    # If user gave an absolute/relative path and it exists, use it
-    if [[ -d "$ARG" ]]; then
-      BACKUP_DIR="$ARG"
+  # fix path when using sudo
+  [[ -n "${SUDO_USER:-}" ]] && root="/home/$SUDO_USER/docker-backups"
+
+  if [[ -n "$arg" ]]; then
+    if [[ -d "$arg" ]]; then
+      BACKUP_DIR="$arg"
       return
     fi
-
-    # Otherwise, see if it's a subdir under ~/docker-backups
-    if [[ -d "$BACKUP_ROOT/$ARG" ]]; then
-      BACKUP_DIR="$BACKUP_ROOT/$ARG"
+    local candidate="$root/$arg"
+    if [[ -d "$candidate" ]]; then
+      BACKUP_DIR="$candidate"
       return
     fi
-
-    echo "[-] Backup directory '$ARG' not found (nor '$BACKUP_ROOT/$ARG')."
+    echo "[-] Not found: $arg"
     exit 1
   fi
 
-  # No argument: pick most recent backup under ~/docker-backups
-  if [[ ! -d "$BACKUP_ROOT" ]]; then
-    echo "[-] No backup root directory found at $BACKUP_ROOT"
+  # auto-pick newest
+  if [[ ! -d "$root" ]]; then
+    echo "[-] $root does not exist"
     exit 1
   fi
 
-  local LATEST
-  LATEST=$(ls -dt "$BACKUP_ROOT"/*/ 2>/dev/null | head -n1 || true)
+  BACKUP_DIR=$(ls -d "$root"/*/ 2>/dev/null | sort -r | head -n1 | cut -f1)
+  BACKUP_DIR="${BACKUP_DIR%/}"   # remove trailing slash
 
-  if [[ -z "$LATEST" ]]; then
-    echo "[-] No backup directories found under $BACKUP_ROOT"
+  if [[ -z "$BACKUP_DIR" ]]; then
+    echo "[-] No backup folders found in $root"
     exit 1
   fi
-
-  BACKUP_DIR="${LATEST%/}"
 }
 
-load_images_from_backup() {
+load_images() {
   shopt -s nullglob
-  local IMAGE_FILES=("$BACKUP_DIR"/*_image.tar)
-
-  if (( ${#IMAGE_FILES[@]} == 0 )); then
-    echo "[!] No *_image.tar files found in $BACKUP_DIR"
-    echo "    If this is only a volume backup, you can skip image restore."
-    shopt -u nullglob
-    return
-  fi
-
-  echo "[*] Found ${#IMAGE_FILES[@]} image backup(s) in $BACKUP_DIR"
-  echo
-
-  for img_tar in "${IMAGE_FILES[@]}"; do
-    echo "======================================"
-    echo "[*] Loading image from: $img_tar"
-    echo "======================================"
-    local OUTPUT
-    OUTPUT=$(docker load -i "$img_tar")
-    echo "$OUTPUT"
-    echo
-  done
-
+  local files=("$BACKUP_DIR"/*_image.tar)
   shopt -u nullglob
+
+  (( ${#files[@]} == 0 )) && { echo "[!] No image tarballs found"; return 0; }
+
+  echo "[*] Loading ${#files[@]} image(s)"
+  for f in "${files[@]}"; do
+    echo "→ $(basename "$f")"
+    docker load --input "$f" | sed 's/^/    /'
+  done
 }
 
-restore_volumes_from_backup() {
+restore_volumes() {
   shopt -s nullglob
-  local VOL_ARCHIVES=("$BACKUP_DIR"/volume_*.tar.gz)
+  local files=("$BACKUP_DIR"/volume_*.tar.gz)
+  shopt -u nullglob
 
-  if (( ${#VOL_ARCHIVES[@]} == 0 )); then
-    echo "[!] No volume_*.tar.gz archives found in $BACKUP_DIR"
-    shopt -u nullglob
-    return
-  fi
+  (( ${#files[@]} == 0 )) && { echo "[!] No volume archives found"; return 0; }
 
-  echo "[*] Found ${#VOL_ARCHIVES[@]} volume backup(s) in $BACKUP_DIR"
-  echo
+  echo "[*] Restoring ${#files[@]} volume(s)"
+  for archive in "${files[@]}"; do
+    local name="$(basename "$archive")"
+    local vol="${name#volume_}"
+    vol="${vol%.tar.gz}"
 
-  for vol_file in "${VOL_ARCHIVES[@]}"; do
-    local base
-    base=$(basename "$vol_file")
-    # volume_<name>.tar.gz -> <name>
-    local vol_name="${base#volume_}"
-    vol_name="${vol_name%.tar.gz}"
+    echo "→ Volume: $vol"
 
-    echo "======================================"
-    echo "[*] Restoring volume '$vol_name' from $base"
-    echo "======================================"
+    docker volume inspect "$vol" &>/dev/null || docker volume create "$vol" >/dev/null
 
-    # Create volume if it doesn't exist
-    if ! docker volume inspect "$vol_name" &>/dev/null; then
-      echo "  - Creating Docker volume '$vol_name'..."
-      docker volume create "$vol_name" >/dev/null
-    else
-      echo "  - Docker volume '$vol_name' already exists. Contents will be overwritten."
-    fi
-
-    # Use a temporary container to untar into the volume
     docker run --rm \
-      -v "${vol_name}:/data" \
-      -v "${BACKUP_DIR}:/backup" \
-      alpine sh -c "cd /data && tar xzf /backup/${base}"
-
-    echo "  - Volume '$vol_name' restore complete."
-    echo
+      -v "$vol:/data" \
+      -v "$BACKUP_DIR:/backup:ro" \
+      alpine \
+      sh -c "apk add --no-cache tar && tar xzf \"/backup/$name\" -C /data --strip-components=1"
   done
-
-  shopt -u nullglob
 }
 
-print_env_files_info() {
+show_env_files() {
   shopt -s nullglob
-  local ENV_FILES=("$BACKUP_DIR"/*.env)
-
-  if (( ${#ENV_FILES[@]} == 0 )); then
-    echo "[!] No .env files found in $BACKUP_DIR"
-    shopt -u nullglob
-    return
-  }
-
-  echo "[*] Found the following env files in $BACKUP_DIR:"
-  for envf in "${ENV_FILES[@]}"; do
-    echo "    - $(basename "$envf")"
-  done
-  echo
-  echo "You can use these with docker run like:"
-  echo "  docker run -d --name <container_name> --env-file $BACKUP_DIR/<container>.env -p <hostPort>:<containerPort> \\"
-  echo "             -v local-llm_ollama:/root/.ollama <image:tag>"
-  echo
+  local files=("$BACKUP_DIR"/*.env)
   shopt -u nullglob
+
+  (( ${#files[@]} == 0 )) && return 0
+
+  echo "[*] Found .env files:"
+  printf '   %s\n' "${files[@]##*/}"
+  echo
+  echo "Example:"
+  echo "docker run -d --name ollama \\"
+  echo "  --env-file \"$BACKUP_DIR/ollama.env\" \\"
+  echo "  -v local-llm_ollama:/root/.ollama -p 11434:11434 ollama/ollama"
 }
 
-# ---------- Main ----------
+# ================= MAIN =================
+main() {
+  echo "=== Docker Restore – Fixed Version ==="
+  echo
 
-require_root
-install_docker_if_missing
-pick_backup_dir "${1:-}"
+  require_root
+  fix_sudo_home
+  install_docker
+  pick_backup_dir "${1:-}"
 
-echo "[+] Using backup directory: $BACKUP_DIR"
-echo
+  echo "[+] Backup directory: $BACKUP_DIR"
+  echo
 
-load_images_from_backup
-restore_volumes_from_backup
-print_env_files_info
+  load_images
+  echo
+  restore_volumes
+  echo
+  show_env_files
 
-echo "[+] Restore steps complete."
-echo
-echo "Next steps (manual, per container), e.g. for Ollama:"
-echo "  1) docker images          # find the restored Ollama image name:tag"
-echo "  2) docker volume ls       # confirm 'local-llm_ollama' exists"
-echo "  3) Start container, for example:"
-echo "       docker run -d --name ollama \\"
-echo "         --env-file $BACKUP_DIR/ollama.env \\"
-echo "         -v local-llm_ollama:/root/.ollama \\"
-echo "         -p 11434:11434 \\"
-echo "         <ollama-image:tag>"
-echo
-echo "Your Ollama models and other volume-backed data should now be restored."
+  echo "++++++++++++++++++++++++++++++++++++++++"
+  echo "[+] RESTORE COMPLETE!"
+  echo "++++++++++++++++++++++++++++++++++++++++"
+  echo "Check with:"
+  echo "  docker images"
+  echo "  docker volume ls"
+  echo
+}
+
+main "$@"
